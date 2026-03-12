@@ -26,6 +26,7 @@ class EmailNotifier:
         self.logger = logger
         self.text_num = EmailConfig.DEFAULT_TEXT_NUM
         self.last_successful_check: Optional[float] = None
+        self.inbox_name: str = "INBOX"  # 默认收件箱名称
 
     def _log(self, message: str, level: str = 'info') -> None:
         if self.logger:
@@ -44,8 +45,12 @@ class EmailNotifier:
         test_mail = None
         try:
             test_mail = imaplib.IMAP4_SSL(self.host, timeout=EmailConfig.CONNECTION_TIMEOUT)
+            # 126邮箱需要客户端标识
+            self._send_client_id(test_mail)
             test_mail.login(self.user, self.token)
-            test_mail.select("INBOX")
+            # 先列出所有文件夹，找到收件箱的正确名称
+            self.inbox_name = self._find_inbox_name(test_mail)
+            test_mail.select(self.inbox_name)
             return True
         except Exception as e:
             self._log(f"[EmailNotifier] 连接失败 {self.user}: {e}", 'error')
@@ -57,30 +62,91 @@ class EmailNotifier:
                 except Exception:
                     pass
 
+    def _send_client_id(self, mail) -> None:
+        """发送客户端标识（126邮箱需要）"""
+        try:
+            # 模拟常见的邮件客户端
+            client_id = ('"imap.126.com"', '"pyIMAP"', '"1.0.0"', '"Python"')
+            # ID命令格式: ID (("name" "value") ("version" "value") ...)
+            mail.id('("name" "pyIMAP" "version" "1.0.0")')
+        except Exception as e:
+            # ID命令失败是正常的，继续登录
+            self._log(f"[EmailNotifier] 客户端ID发送失败（可忽略）: {e}", 'warning')
+
+    def _find_inbox_name(self, mail) -> str:
+        """查找收件箱的正确名称"""
+        try:
+            # 列出所有文件夹
+            status, folder_list = mail.list()
+            if status != 'OK':
+                return "INBOX"
+            
+            folder_list = folder_list or []
+            # 常见的收件箱名称模式
+            inbox_patterns = ['INBOX', 'inbox', '收件箱', 'INBOX/Archive', 'Trash']
+            
+            for folder in folder_list:
+                # folder 格式: b'(\\HasNoChildren) "/" "INBOX"'
+                if isinstance(folder, bytes):
+                    folder = folder.decode('utf-8', errors='ignore')
+                
+                # 检查是否包含收件箱相关的名称
+                folder_name = folder.split('"')[-2] if '"' in folder else folder
+                
+                # 优先匹配常见的收件箱名称
+                for pattern in inbox_patterns:
+                    if pattern.lower() in folder_name.lower():
+                        self._log(f"[EmailNotifier] 找到收件箱: {folder_name}", 'info')
+                        return folder_name
+                
+                # 如果找到包含 inbox 的名称
+                if 'inbox' in folder_name.lower():
+                    self._log(f"[EmailNotifier] 找到收件箱: {folder_name}", 'info')
+                    return folder_name
+            
+            return "INBOX"
+            
+        except Exception as e:
+            self._log(f"[EmailNotifier] 查找收件箱名称失败: {e}", 'warning')
+            return "INBOX"
+
     def _connect(self) -> None:
         try:
             if self.mail:
                 try:
                     self.mail.noop()
-                    # 连接活跃，现在确保 INBOX 处于 SELECTED 状态
-                    status, _ = self.mail.select("INBOX")
+                    # 连接活跃，尝试重新选择收件箱
+                    status, _ = self.mail.select(self.inbox_name)
                     if status == 'OK':
-                        return # 连接活跃且 INBOX 已选中
+                        return  # 连接活跃且收件箱已选中
                     else:
-                        self._log(f"[EmailNotifier] 重新选择INBOX失败, 状态: {status}. 尝试重新连接.", 'warning')
-                        # 选择失败，将继续执行清理和重新连接
+                        self._log(f"[EmailNotifier] 重新选择收件箱失败, 状态: {status}. 尝试重新连接.", 'warning')
                 except Exception:
-                    pass # noop() 或 select() 失败，将继续执行重新连接
+                    pass  # noop() 或 select() 失败，将继续执行重新连接
             
-            self.cleanup() # 清理任何可能存在的无效连接
+            self.cleanup()  # 清理任何可能存在的无效连接
+            
+            # 创建SSL连接时禁用证书验证（针对部分邮箱服务器）
+            context = __import__('ssl').create_default_context()
+            context.check_hostname = False
+            context.verify_mode = __import__('ssl').CERT_NONE
+            
             self.mail = imaplib.IMAP4_SSL(self.host, timeout=EmailConfig.CONNECTION_TIMEOUT)
+            
+            # 126邮箱需要先发送客户端标识
+            self._send_client_id(self.mail)
+            
             self.mail.login(self.user, self.token)
-            status, _ = self.mail.select("INBOX") # 登录后选择 INBOX
+            
+            # 登录后查找收件箱的正确名称
+            self.inbox_name = self._find_inbox_name(self.mail)
+            
+            status, _ = self.mail.select(self.inbox_name)  # 登录后选择收件箱
             if status != 'OK':
-                # 初始连接时选择 INBOX 失败是严重错误，记录并抛出异常
-                self._log(f"[EmailNotifier] 初始连接选择INBOX失败: {status}", 'error')
-                self.cleanup() # 抛出异常前清理
-                raise ConnectionError(f"无法选择INBOX: {status}") # 抛出更具体的错误
+                # 初始连接时选择收件箱失败是严重错误
+                self._log(f"[EmailNotifier] 初始连接选择收件箱失败: {status}", 'error')
+                self.cleanup()
+                raise ConnectionError(f"无法选择收件箱: {status}")
         except Exception as e:
             self._log(f"[EmailNotifier] 连接失败: {e}", 'error')
             self.cleanup()
