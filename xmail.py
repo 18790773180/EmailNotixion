@@ -168,6 +168,11 @@ class EmailNotifier:
         try:
             self._connect()
             
+            status, _ = self.mail.select("INBOX")
+            if status != 'OK':
+                self._log(f"[EmailNotifier] 无法选择 INBOX: {status}", 'error')
+                return None
+            
             typ, data = self.mail.uid('SEARCH', None, 'ALL')
             if typ != 'OK' or not data or not data[0]:
                 return None
