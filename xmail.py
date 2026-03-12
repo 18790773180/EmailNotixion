@@ -62,14 +62,25 @@ class EmailNotifier:
             if self.mail:
                 try:
                     self.mail.noop()
-                    return
+                    # 连接活跃，现在确保 INBOX 处于 SELECTED 状态
+                    status, _ = self.mail.select("INBOX")
+                    if status == 'OK':
+                        return # 连接活跃且 INBOX 已选中
+                    else:
+                        self._log(f"[EmailNotifier] 重新选择INBOX失败, 状态: {status}. 尝试重新连接.", 'warning')
+                        # 选择失败，将继续执行清理和重新连接
                 except Exception:
-                    pass
+                    pass # noop() 或 select() 失败，将继续执行重新连接
             
-            self.cleanup()
+            self.cleanup() # 清理任何可能存在的无效连接
             self.mail = imaplib.IMAP4_SSL(self.host, timeout=EmailConfig.CONNECTION_TIMEOUT)
             self.mail.login(self.user, self.token)
-            self.mail.select("INBOX")
+            status, _ = self.mail.select("INBOX") # 登录后选择 INBOX
+            if status != 'OK':
+                # 初始连接时选择 INBOX 失败是严重错误，记录并抛出异常
+                self._log(f"[EmailNotifier] 初始连接选择INBOX失败: {status}", 'error')
+                self.cleanup() # 抛出异常前清理
+                raise ConnectionError(f"无法选择INBOX: {status}") # 抛出更具体的错误
         except Exception as e:
             self._log(f"[EmailNotifier] 连接失败: {e}", 'error')
             self.cleanup()
@@ -167,11 +178,6 @@ class EmailNotifier:
     def check_and_notify(self) -> Optional[List[Tuple[Optional[datetime], str, str]]]:
         try:
             self._connect()
-            
-            status, _ = self.mail.select("INBOX")
-            if status != 'OK':
-                self._log(f"[EmailNotifier] 无法选择 INBOX: {status}", 'error')
-                return None
             
             typ, data = self.mail.uid('SEARCH', None, 'ALL')
             if typ != 'OK' or not data or not data[0]:
