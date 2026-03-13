@@ -1,4 +1,4 @@
-"""邮件检查模块 - 同步 IMAP 实现 - 126/163邮箱ID命令修复版"""
+"""邮件检查模块 - 同步 IMAP 实现 - 126/163邮箱ID命令 + SELECT重试修复版"""
 import imaplib
 import email as email_stdlib
 import time
@@ -13,10 +13,11 @@ class EmailConfig:
     NEW_EMAIL_WINDOW = 120
     DEFAULT_TEXT_NUM = 50
     IMAP_PORT = 143  # 使用143端口 + STARTTLS，符合官方示例
+    SELECT_RETRY_MAX = 5  # 最大重试次数（根据文章解决方案）
 
 
 class EmailNotifier:
-    """同步邮件通知器 - 针对126/163邮箱优化，添加ID命令"""
+    """同步邮件通知器 - 针对126/163邮箱优化，添加ID命令和SELECT重试"""
     
     def __init__(self, host: str, user: str, token: str, logger=None):
         self.host = host
@@ -70,6 +71,33 @@ class EmailNotifier:
             self._log(f"[EmailNotifier] ID命令失败（可忽略）: {e}", 'warning')
             return False
 
+    def _select_mailbox_with_retry(self, mailbox: str, mail) -> Tuple[str, Optional[List]]:
+        """带重试的select方法（根据文章解决方案）"""
+        # 先测试连接活性
+        try:
+            typ, _ = mail.noop()
+            if typ != 'OK':
+                self._log(f"[EmailNotifier] NOOP测试失败: {typ}", 'warning')
+        except Exception:
+            pass
+        
+        status, data = mail.select(mailbox)
+        retry_count = 0
+        while status != 'OK' and retry_count < EmailConfig.SELECT_RETRY_MAX:
+            retry_count += 1
+            self._log(f"[EmailNotifier] select失败 (状态: {status})，重试 {retry_count}/{EmailConfig.SELECT_RETRY_MAX} 次...", 'warning')
+            time.sleep(0.5)  # 短暂延迟
+            status, data = mail.select(mailbox)
+            if status == 'OK':
+                self._log(f"[EmailNotifier] select重试成功 (第{retry_count}次)", 'info')
+                return status, data
+        
+        if status != 'OK':
+            error_msg = data[0].decode('utf-8', errors='ignore') if data and isinstance(data[0], bytes) else str(data)
+            self._log(f"[EmailNotifier] select重试 {EmailConfig.SELECT_RETRY_MAX} 次后仍失败: {error_msg}", 'error')
+            return status, data
+        return status, data
+
     def test_connection(self) -> bool:
         test_mail = None
         try:
@@ -113,18 +141,18 @@ class EmailNotifier:
             self.inbox_name = self._find_inbox_name(test_mail)
             self._log(f"[EmailNotifier] 使用收件箱: {self.inbox_name}", 'info')
             
-            # 选择收件箱（现在应该成功，避免Unsafe Login）
-            status, data = test_mail.select(self.inbox_name)
-            self._log(f"[EmailNotifier] 选择收件箱状态: {status}", 'info')
+            # **关键修复：使用带重试的select**
+            status, data = self._select_mailbox_with_retry(self.inbox_name, test_mail)
+            self._log(f"[EmailNotifier] 最终选择收件箱状态: {status}", 'info')
             if status != 'OK' and data:
                 error_msg = data[0].decode('utf-8', errors='ignore') if isinstance(data[0], bytes) else str(data[0])
                 self._log(f"[EmailNotifier] 选择收件箱错误详情: {error_msg}", 'error')
             
-            # 尝试备用收件箱名称
+            # 尝试备用收件箱名称（如果主select失败）
             if status != 'OK':
                 for alt_name in ['INBOX', 'inbox', '收件箱']:
                     if alt_name != self.inbox_name:
-                        alt_status, _ = test_mail.select(alt_name)
+                        alt_status, _ = self._select_mailbox_with_retry(alt_name, test_mail)
                         if alt_status == 'OK':
                             self.inbox_name = alt_name
                             self._log(f"[EmailNotifier] 备用收件箱成功: {alt_name}", 'info')
@@ -175,8 +203,8 @@ class EmailNotifier:
                 try:
                     typ, _ = self.mail.noop()
                     if typ == 'OK':
-                        # 重新选择收件箱
-                        status, _ = self.mail.select(self.inbox_name)
+                        # 重新选择收件箱（带重试）
+                        status, _ = self._select_mailbox_with_retry(self.inbox_name, self.mail)
                         if status == 'OK':
                             return
                 except Exception:
@@ -201,25 +229,27 @@ class EmailNotifier:
             # **关键：登录后发送ID命令**
             self._send_id_command(self.mail)
             
-            # 查找并选择收件箱
+            # 查找并选择收件箱（带重试）
             self.inbox_name = self._find_inbox_name(self.mail)
-            status, data = self.mail.select(self.inbox_name)
+            status, data = self._select_mailbox_with_retry(self.inbox_name, self.mail)
             
             if status != 'OK':
                 error_msg = data[0].decode('utf-8', errors='ignore') if data and isinstance(data[0], bytes) else str(data)
                 self._log(f"[EmailNotifier] 选择收件箱失败: {error_msg}", 'error')
                 
-                # 备用尝试
+                # 备用尝试（带重试）
                 for alt in ['INBOX', 'inbox']:
                     if alt != self.inbox_name:
-                        status, _ = self.mail.select(alt)
-                        if status == 'OK':
+                        alt_status, _ = self._select_mailbox_with_retry(alt, self.mail)
+                        if alt_status == 'OK':
                             self.inbox_name = alt
+                            self._log(f"[EmailNotifier] 备用收件箱成功: {alt}", 'info')
+                            status = 'OK'
                             break
                 
                 if status != 'OK':
                     self.cleanup()
-                    raise ConnectionError(f"无法选择收件箱: {status} - {error_msg}")
+                    raise ConnectionError(f"无法选择收件箱（重试失败）: {status} - {error_msg}")
                     
         except Exception as e:
             error_str = str(e).encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
@@ -322,9 +352,9 @@ class EmailNotifier:
 
     def check_and_notify(self) -> Optional[List[Tuple[Optional[datetime], str, str]]]:
         try:
-            self._connect()
+            self._connect()  # 确保select已成功执行（状态为SELECTED）
             
-            # 搜索邮件（使用UID以提高效率）
+            # 搜索邮件（现在状态正确，不会报"state auth"错误）
             typ, data = self.mail.uid('SEARCH', None, 'ALL')
             if typ != 'OK' or not data or not data[0]:
                 typ, data = self.mail.search(None, 'ALL')  # 备用普通搜索
