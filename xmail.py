@@ -1,4 +1,4 @@
-"""邮件检查模块 - 同步 IMAP 实现 - 126/163邮箱ID命令 + SELECT重试修复版"""
+"""邮件检查模块 - 同步 IMAP 实现 - 126邮箱Unsafe Login最终修复版"""
 import imaplib
 import email as email_stdlib
 import time
@@ -12,12 +12,12 @@ class EmailConfig:
     CONNECTION_TIMEOUT = 30
     NEW_EMAIL_WINDOW = 120
     DEFAULT_TEXT_NUM = 50
-    IMAP_PORT = 143  # 使用143端口 + STARTTLS，符合官方示例
-    SELECT_RETRY_MAX = 5  # 最大重试次数（根据文章解决方案）
+    SELECT_RETRY_MAX = 5
+    SELECT_RETRY_DELAY = 1.0  # 增加延迟，避免服务器限流
 
 
 class EmailNotifier:
-    """同步邮件通知器 - 针对126/163邮箱优化，添加ID命令和SELECT重试"""
+    """同步邮件通知器 - 针对126邮箱Unsafe Login优化"""
     
     def __init__(self, host: str, user: str, token: str, logger=None):
         self.host = host
@@ -33,9 +33,16 @@ class EmailNotifier:
     def _log(self, message: str, level: str = 'info') -> None:
         if self.logger:
             try:
-                # 修复编码错误：确保消息UTF-8兼容
-                message = str(message).encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
-                getattr(self.logger, level)(message)
+                # 强化编码：捕获所有UnicodeError
+                if isinstance(message, Exception):
+                    message = str(message)
+                message_bytes = str(message).encode('utf-8', errors='ignore')
+                safe_message = message_bytes.decode('utf-8', errors='ignore')
+                getattr(self.logger, level)(safe_message)
+            except UnicodeError:
+                # 最后fallback到ASCII
+                ascii_msg = str(message).encode('ascii', errors='ignore').decode('ascii', errors='ignore')
+                getattr(self.logger, level)(ascii_msg)
             except Exception:
                 pass
 
@@ -49,60 +56,75 @@ class EmailNotifier:
                 self.mail = None
 
     def _send_id_command(self, mail) -> bool:
-        """发送IMAP ID命令（模拟Java示例）"""
+        """增强IMAP ID命令（针对126 Unsafe Login，添加完整字段）"""
         try:
-            # 模拟Java HashMap IAM的键值对
+            # 扩展ID：模拟官方 + 网易要求（name, version, vendor, os, date 等）
             id_params = (
-                '"name" "pyIMAPClient"',
-                '"version" "1.0.0"',
-                '"vendor" "PythonClient"',
-                '"support-email" "support@example.com"'
+                '"name" "NetEaseMailClient"',  # 使用网易风格名称
+                '"version" "2.0.0"',
+                '"vendor" "EmailNotixion"',
+                '"os" "Windows"',
+                '"support-url" "https://mail.126.com"',
+                '"date" "Mon, 1 Jan 2024 00:00:00 +0000"',  # 添加日期字段
+                '"threading" "REFERENCES THREAD ordered subject not sent"'  # 额外线程支持
             )
-            # 构建ID命令字符串：ID (key value key value ...)
             id_string = ' '.join(id_params)
+            self._log(f"[EmailNotifier] 发送增强ID: {id_string[:100]}...", 'info')  # 只日志前100字符避免过长
             typ, data = mail.id(id_string)
             if typ == 'OK':
-                self._log(f"[EmailNotifier] ID命令发送成功: {id_string}", 'info')
+                self._log("[EmailNotifier] ID命令发送成功（增强版）", 'info')
                 return True
             else:
-                self._log(f"[EmailNotifier] ID命令响应: {typ}, 数据: {data}", 'warning')
+                self._log(f"[EmailNotifier] 增强ID响应: {typ}, 数据: {data}", 'warning')
+                # Fallback: 尝试最小ID
+                min_id = '"name" "EmailClient" "version" "1.0"'
+                typ, data = mail.id(min_id)
+                if typ == 'OK':
+                    self._log("[EmailNotifier] 最小ID发送成功", 'info')
+                    return True
+                self._log(f"[EmailNotifier] 最小ID也失败: {typ}", 'warning')
                 return False
         except Exception as e:
-            self._log(f"[EmailNotifier] ID命令失败（可忽略）: {e}", 'warning')
+            self._log(f"[EmailNotifier] ID命令异常（忽略）: {e}", 'warning')
             return False
 
     def _select_mailbox_with_retry(self, mailbox: str, mail) -> Tuple[str, Optional[List]]:
-        """带重试的select方法（根据文章解决方案）"""
-        # 先测试连接活性
+        """带重试的select方法（增加延迟）"""
+        # 测试连接活性
         try:
             typ, _ = mail.noop()
-            if typ != 'OK':
-                self._log(f"[EmailNotifier] NOOP测试失败: {typ}", 'warning')
-        except Exception:
-            pass
+            self._log(f"[EmailNotifier] NOOP前select测试: {typ}", 'debug')
+        except Exception as e:
+            self._log(f"[EmailNotifier] NOOP失败: {e}", 'warning')
         
         status, data = mail.select(mailbox)
         retry_count = 0
         while status != 'OK' and retry_count < EmailConfig.SELECT_RETRY_MAX:
             retry_count += 1
-            self._log(f"[EmailNotifier] select失败 (状态: {status})，重试 {retry_count}/{EmailConfig.SELECT_RETRY_MAX} 次...", 'warning')
-            time.sleep(0.5)  # 短暂延迟
+            self._log(f"[EmailNotifier] select失败 (状态: {status})，重试 {retry_count}/{EmailConfig.SELECT_RETRY_MAX} 次，延迟{EmailConfig.SELECT_RETRY_DELAY}s...", 'warning')
+            time.sleep(EmailConfig.SELECT_RETRY_DELAY)
             status, data = mail.select(mailbox)
             if status == 'OK':
                 self._log(f"[EmailNotifier] select重试成功 (第{retry_count}次)", 'info')
                 return status, data
         
         if status != 'OK':
-            error_msg = data[0].decode('utf-8', errors='ignore') if data and isinstance(data[0], bytes) else str(data)
-            self._log(f"[EmailNotifier] select重试 {EmailConfig.SELECT_RETRY_MAX} 次后仍失败: {error_msg}", 'error')
+            error_msg = ''
+            if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], bytes):
+                try:
+                    error_msg = data[0].decode('utf-8', errors='ignore')
+                except UnicodeError:
+                    error_msg = data[0].decode('ascii', errors='ignore')
+            self._log(f"[EmailNotifier] select重试失败: {error_msg or 'Unknown Error'}", 'error')
             return status, data
         return status, data
 
     def test_connection(self) -> bool:
         test_mail = None
         try:
-            # 使用官方推荐：IMAP4 on 143端口
-            test_mail = imaplib.IMAP4(self.host, EmailConfig.IMAP_PORT, timeout=EmailConfig.CONNECTION_TIMEOUT)
+            # **优先SSL 993端口**（更安全，绕过Unsafe Login）
+            self._log(f"[EmailNotifier] 尝试SSL 993连接到 {self.host}...", 'info')
+            test_mail = imaplib.IMAP4_SSL(self.host, 993, timeout=EmailConfig.CONNECTION_TIMEOUT)
             
             # 获取服务器能力
             try:
@@ -111,44 +133,33 @@ class EmailNotifier:
             except Exception as e:
                 self._log(f"[EmailNotifier] 获取能力失败: {e}", 'warning')
             
-            # 升级到TLS（STARTTLS）
-            try:
-                typ, data = test_mail.starttls()
-                self._log(f"[EmailNotifier] STARTTLS状态: {typ}", 'info')
-                if typ != 'OK':
-                    raise Exception("STARTTLS失败")
-            except Exception as e:
-                self._log(f"[EmailNotifier] STARTTLS失败: {e}，尝试SSL连接", 'warning')
-                # 备用：直接SSL on 993
-                test_mail.close()
-                test_mail = imaplib.IMAP4_SSL(self.host, 993, timeout=EmailConfig.CONNECTION_TIMEOUT)
-            
             # 登录（使用授权码）
             self._log(f"[EmailNotifier] 尝试登录 {self.user}...", 'info')
             test_mail.login(self.user, self.token)
-            self._log(f"[EmailNotifier] 登录成功", 'info')
+            self._log("[EmailNotifier] 登录成功", 'info')
             
-            # **关键：登录后发送ID命令**（符合Java示例）
-            self._send_id_command(test_mail)
+            # **登录后立即发送增强ID**（关键步骤）
+            id_success = self._send_id_command(test_mail)
+            if not id_success:
+                self._log("[EmailNotifier] ID发送失败，但继续尝试select", 'warning')
             
-            # 列出所有文件夹
+            # 列出文件夹
             status, folder_list = test_mail.list()
             self._log(f"[EmailNotifier] 文件夹列表状态: {status}", 'info')
-            if folder_list:
-                self._log(f"[EmailNotifier] 文件夹示例: {folder_list[:2]}...", 'info')
             
-            # 查找收件箱名称
+            # 查找收件箱
             self.inbox_name = self._find_inbox_name(test_mail)
             self._log(f"[EmailNotifier] 使用收件箱: {self.inbox_name}", 'info')
             
-            # **关键修复：使用带重试的select**
+            # **带重试的select**
             status, data = self._select_mailbox_with_retry(self.inbox_name, test_mail)
             self._log(f"[EmailNotifier] 最终选择收件箱状态: {status}", 'info')
+            
             if status != 'OK' and data:
                 error_msg = data[0].decode('utf-8', errors='ignore') if isinstance(data[0], bytes) else str(data[0])
                 self._log(f"[EmailNotifier] 选择收件箱错误详情: {error_msg}", 'error')
             
-            # 尝试备用收件箱名称（如果主select失败）
+            # 备用收件箱（带重试）
             if status != 'OK':
                 for alt_name in ['INBOX', 'inbox', '收件箱']:
                     if alt_name != self.inbox_name:
@@ -158,6 +169,17 @@ class EmailNotifier:
                             self._log(f"[EmailNotifier] 备用收件箱成功: {alt_name}", 'info')
                             status = 'OK'
                             break
+            
+            # 如果993失败，尝试143 + STARTTLS作为最终备用
+            if status != 'OK':
+                self._log("[EmailNotifier] 993失败，尝试143 STARTTLS...", 'warning')
+                test_mail.close()
+                test_mail = imaplib.IMAP4(self.host, 143, timeout=EmailConfig.CONNECTION_TIMEOUT)
+                typ, _ = test_mail.starttls()
+                if typ == 'OK':
+                    test_mail.login(self.user, self.token)
+                    self._send_id_command(test_mail)
+                    status, _ = self._select_mailbox_with_retry(self.inbox_name, test_mail)
             
             return status == 'OK'
             
@@ -183,11 +205,10 @@ class EmailNotifier:
                 if isinstance(folder, bytes):
                     folder = folder.decode('utf-8', errors='ignore')
                 
-                # 解析文件夹名称（格式如：() "/" "INBOX"）
                 if '"' in folder:
                     parts = [p.strip() for p in folder.split('"')]
                     if len(parts) >= 2:
-                        folder_name = parts[1]  # 取引号内的名称
+                        folder_name = parts[1]
                         if folder_name.upper() == 'INBOX':
                             return folder_name
                 
@@ -197,13 +218,12 @@ class EmailNotifier:
             return "INBOX"
 
     def _connect(self) -> None:
+        # 与test_connection类似逻辑，确保生产连接也优先SSL
         try:
-            # 检查现有连接
             if self.mail:
                 try:
                     typ, _ = self.mail.noop()
                     if typ == 'OK':
-                        # 重新选择收件箱（带重试）
                         status, _ = self._select_mailbox_with_retry(self.inbox_name, self.mail)
                         if status == 'OK':
                             return
@@ -212,24 +232,12 @@ class EmailNotifier:
             
             self.cleanup()
             
-            # 新连接：IMAP4 on 143 + STARTTLS
-            try:
-                self.mail = imaplib.IMAP4(self.host, EmailConfig.IMAP_PORT, timeout=EmailConfig.CONNECTION_TIMEOUT)
-                typ, _ = self.mail.starttls()
-                if typ != 'OK':
-                    raise Exception("STARTTLS失败")
-            except Exception as e:
-                self._log(f"[EmailNotifier] STARTTLS失败: {e}，切换SSL", 'warning')
-                self.mail = imaplib.IMAP4_SSL(self.host, 993, timeout=EmailConfig.CONNECTION_TIMEOUT)
-            
-            # 登录
+            # 优先SSL 993
+            self.mail = imaplib.IMAP4_SSL(self.host, 993, timeout=EmailConfig.CONNECTION_TIMEOUT)
             self.mail.login(self.user, self.token)
-            self._log(f"[EmailNotifier] 登录成功", 'info')
-            
-            # **关键：登录后发送ID命令**
+            self._log("[EmailNotifier] 登录成功", 'info')
             self._send_id_command(self.mail)
             
-            # 查找并选择收件箱（带重试）
             self.inbox_name = self._find_inbox_name(self.mail)
             status, data = self._select_mailbox_with_retry(self.inbox_name, self.mail)
             
@@ -237,19 +245,26 @@ class EmailNotifier:
                 error_msg = data[0].decode('utf-8', errors='ignore') if data and isinstance(data[0], bytes) else str(data)
                 self._log(f"[EmailNotifier] 选择收件箱失败: {error_msg}", 'error')
                 
-                # 备用尝试（带重试）
                 for alt in ['INBOX', 'inbox']:
                     if alt != self.inbox_name:
                         alt_status, _ = self._select_mailbox_with_retry(alt, self.mail)
                         if alt_status == 'OK':
                             self.inbox_name = alt
-                            self._log(f"[EmailNotifier] 备用收件箱成功: {alt}", 'info')
                             status = 'OK'
                             break
                 
                 if status != 'OK':
+                    # 备用143
                     self.cleanup()
-                    raise ConnectionError(f"无法选择收件箱（重试失败）: {status} - {error_msg}")
+                    self.mail = imaplib.IMAP4(self.host, 143, timeout=EmailConfig.CONNECTION_TIMEOUT)
+                    self.mail.starttls()
+                    self.mail.login(self.user, self.token)
+                    self._send_id_command(self.mail)
+                    status, _ = self._select_mailbox_with_retry(self.inbox_name, self.mail)
+                
+                if status != 'OK':
+                    self.cleanup()
+                    raise ConnectionError(f"无法选择收件箱（所有尝试失败）: {error_msg}")
                     
         except Exception as e:
             error_str = str(e).encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
@@ -257,11 +272,10 @@ class EmailNotifier:
             self.cleanup()
             raise
 
-    # 以下方法保持不变（邮件解析相关）
+    # 邮件解析方法保持不变（略，复制之前的 _html_to_text, _get_email_content 等）
     def _html_to_text(self, html: str) -> str:
         if not html:
             return ""
-        
         def decode_qp(match):
             try:
                 hex_str = match.group(0).replace('=', '')
@@ -270,17 +284,14 @@ class EmailNotifier:
             except:
                 pass
             return match.group(0)
-        
         text = re.sub(r'(?:=[0-9A-F]{2})+', decode_qp, html)
         text = text.replace('=3D', '=')
         text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<[^>]+>', '', text)
-        
         entities = {'&nbsp;': ' ', '&lt;': '<', '&gt;': '>', '&amp;': '&', '&quot;': '"'}
         for entity, char in entities.items():
             text = text.replace(entity, char)
-        
         return re.sub(r'\s+', ' ', text).strip()
 
     def _get_email_content(self, msg) -> Tuple[str, str]:
@@ -291,12 +302,9 @@ class EmailNotifier:
                 subject = decoded.decode('utf-8', errors='ignore') if isinstance(decoded, bytes) else str(decoded)
             except Exception:
                 subject = str(msg['Subject'])
-        
         if len(subject) > self.text_num:
             subject = subject[:self.text_num] + "..."
-
         content = "（无文本内容）"
-        
         if msg.is_multipart():
             text_content = html_content = None
             for part in msg.walk():
@@ -314,7 +322,6 @@ class EmailNotifier:
                         html_content = decoded
                 except Exception:
                     continue
-            
             if text_content:
                 content = self._process_content(text_content)
             elif html_content:
@@ -330,7 +337,6 @@ class EmailNotifier:
                     content = self._process_content(text)
             except Exception:
                 pass
-        
         return subject, content
 
     def _process_content(self, text: str) -> str:
@@ -352,44 +358,33 @@ class EmailNotifier:
 
     def check_and_notify(self) -> Optional[List[Tuple[Optional[datetime], str, str]]]:
         try:
-            self._connect()  # 确保select已成功执行（状态为SELECTED）
-            
-            # 搜索邮件（现在状态正确，不会报"state auth"错误）
+            self._connect()
             typ, data = self.mail.uid('SEARCH', None, 'ALL')
             if typ != 'OK' or not data or not data[0]:
-                typ, data = self.mail.search(None, 'ALL')  # 备用普通搜索
+                typ, data = self.mail.search(None, 'ALL')
                 if typ != 'OK' or not data or not data[0]:
                     return None
-
             all_uids = data[0].split()
             if not all_uids:
                 return None
-            
             if self.last_uid is None:
                 self.last_uid = all_uids[-1]
                 self.last_successful_check = time.time()
                 self._log(f"[EmailNotifier] 初始化基准 UID: {self.last_uid}")
                 return None
-
             new_emails = []
             new_last_uid = self.last_uid
-            
             for uid in all_uids:
                 if uid <= self.last_uid:
                     continue
-                
                 info = self._get_email_info(uid)
                 if info and self._is_recent(info[0]):
                     new_emails.append(info)
-                
                 if uid > new_last_uid:
                     new_last_uid = uid
-
             self.last_uid = new_last_uid
             self.last_successful_check = time.time()
-            
             return new_emails if new_emails else None
-            
         except Exception as e:
             error_str = str(e).encode('utf-8', errors='ignore').decode('utf-8', errors='ignore')
             self._log(f"[EmailNotifier] 检查错误: {error_str}", 'error')
@@ -401,9 +396,7 @@ class EmailNotifier:
             typ, msg_data = self.mail.uid('FETCH', uid, '(RFC822)')
             if typ != 'OK' or not msg_data or not msg_data[0]:
                 return None
-
             msg = email_stdlib.message_from_bytes(msg_data[0][1])
-            
             local_date = None
             try:
                 date_tuple = email_stdlib.utils.parsedate_tz(msg['Date'])
@@ -411,10 +404,8 @@ class EmailNotifier:
                     local_date = datetime.fromtimestamp(email_stdlib.utils.mktime_tz(date_tuple))
             except Exception:
                 pass
-
             subject, content = self._get_email_content(msg)
             return local_date, subject, content
-            
         except Exception as e:
             self._log(f"[EmailNotifier] 获取邮件失败 UID {uid}: {e}", 'error')
             return None
